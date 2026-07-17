@@ -1,73 +1,21 @@
-import base64
-import os
+from bisect import bisect_right
 import re
 from typing import Annotated, Any
-from urllib.parse import unquote, urlparse
 
 from fastmcp import Context
 from mcp.types import ToolAnnotations
 
 from services.registry import mcp_for_unity_tool
+from services.hashline import Snapshot, decode_unity_text_response, normalize_text_uri, snapshots
+from services.hashline.protocol import snapshot_key
 from services.tools import get_unity_instance_from_context
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
 
 
-def _split_uri(uri: str) -> tuple[str, str]:
-    """Split an incoming URI or path into (name, directory) suitable for Unity.
-
-    Rules:
-    - mcpforunity://path/Assets/... → keep as Assets-relative (after decode/normalize)
-    - file://... → percent-decode, normalize, strip host and leading slashes,
-        then, if any 'Assets' segment exists, return path relative to that 'Assets' root.
-        Otherwise, fall back to original name/dir behavior.
-    - plain paths → decode/normalize separators; if they contain an 'Assets' segment,
-        return relative to 'Assets'.
-    """
-    raw_path: str
-    if uri.startswith("mcpforunity://path/"):
-        raw_path = uri[len("mcpforunity://path/"):]
-    elif uri.startswith("file://"):
-        parsed = urlparse(uri)
-        host = (parsed.netloc or "").strip()
-        p = parsed.path or ""
-        # UNC: file://server/share/... -> //server/share/...
-        if host and host.lower() != "localhost":
-            p = f"//{host}{p}"
-        # Use percent-decoded path, preserving leading slashes
-        raw_path = unquote(p)
-    else:
-        raw_path = uri
-
-    # Percent-decode any residual encodings and normalize separators
-    raw_path = unquote(raw_path).replace("\\", "/")
-    # Strip leading slash only for Windows drive-letter forms like "/C:/..."
-    if os.name == "nt" and len(raw_path) >= 3 and raw_path[0] == "/" and raw_path[2] == ":":
-        raw_path = raw_path[1:]
-
-    # Normalize path (collapse ../, ./)
-    norm = os.path.normpath(raw_path).replace("\\", "/")
-
-    # If an 'Assets' segment exists, compute path relative to it (case-insensitive)
-    parts = [p for p in norm.split("/") if p not in ("", ".")]
-    idx = next((i for i, seg in enumerate(parts)
-                if seg.lower() == "assets"), None)
-    assets_rel = "/".join(parts[idx:]) if idx is not None else None
-
-    effective_path = assets_rel if assets_rel else norm
-    # For POSIX absolute paths outside Assets, drop the leading '/'
-    # to return a clean relative-like directory (e.g., '/tmp' -> 'tmp').
-    if effective_path.startswith("/"):
-        effective_path = effective_path[1:]
-
-    name = os.path.splitext(os.path.basename(effective_path))[0]
-    directory = os.path.dirname(effective_path)
-    return name, directory
-
-
 @mcp_for_unity_tool(
     unity_target="manage_script",
-    description="Searches a file with a regex pattern and returns line numbers and excerpts.",
+    description="Search any project text file with a regex and return line numbers, excerpts, and editable hashline anchors.",
     annotations=ToolAnnotations(
         title="Find in File",
         readOnlyHint=True,
@@ -87,34 +35,33 @@ async def find_in_file(
     await ctx.info(
         f"Processing find_in_file: {uri} (unity_instance={unity_instance or 'default'})")
 
-    name, directory = _split_uri(uri)
-
     # 1. Read file content via Unity
     read_resp = await send_with_unity_instance(
         async_send_command_with_retry,
         unity_instance,
         "manage_script",
         {
-            "action": "read",
-            "name": name,
-            "path": directory,
+            "action": "read_text",
+            "file": normalize_text_uri(uri),
         },
     )
 
     if not isinstance(read_resp, dict) or not read_resp.get("success"):
         return read_resp if isinstance(read_resp, dict) else {"success": False, "message": str(read_resp)}
 
-    data = read_resp.get("data", {})
-    contents = data.get("contents")
-    if not contents and data.get("contentsEncoded") and data.get("encodedContents"):
-        try:
-            contents = base64.b64decode(data.get("encodedContents", "").encode(
-                "utf-8")).decode("utf-8", "replace")
-        except (ValueError, TypeError, base64.binascii.Error):
-            contents = contents or ""
-
-    if contents is None:
-        return {"success": False, "message": "Could not read file content."}
+    try:
+        contents, data = decode_unity_text_response(read_resp)
+        canonical_path = str(data["path"])
+        snapshot = Snapshot.create(
+            snapshot_key(unity_instance, canonical_path),
+            str(data["sha256"]),
+            str(data.get("encoding", "utf-8")),
+            str(data.get("newline", "lf")),
+            contents,
+        )
+        snapshots.put(snapshot)
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"success": False, "code": "E_WRITE", "message": f"Could not read text metadata: {exc}"}
 
     # 2. Perform regex search
     flags = re.MULTILINE
@@ -135,6 +82,8 @@ async def find_in_file(
     # Let's search the whole content and map back to lines.
 
     found = list(regex.finditer(contents))
+    line_breaks = list(re.finditer(r"\r\n|\r|\n", contents))
+    line_starts = [0] + [match.end() for match in line_breaks]
 
     results = []
     count = 0
@@ -146,17 +95,13 @@ async def find_in_file(
         start_idx = m.start()
         end_idx = m.end()
 
-        # Calculate line number
-        # Count newlines up to start_idx
-        line_num = contents.count('\n', 0, start_idx) + 1
+        line_index = bisect_right(line_starts, start_idx) - 1
+        line_num = line_index + 1
+        if line_num > len(snapshot.anchors):
+            continue
 
-        # Get line content for excerpt
-        # Find start of line
-        line_start = contents.rfind('\n', 0, start_idx) + 1
-        # Find end of line
-        line_end = contents.find('\n', start_idx)
-        if line_end == -1:
-            line_end = len(contents)
+        line_start = line_starts[line_index]
+        line_end = line_breaks[line_index].start() if line_index < len(line_breaks) else len(contents)
 
         line_content = contents[line_start:line_end]
 
@@ -164,6 +109,7 @@ async def find_in_file(
         # We can just return the line content as excerpt
 
         results.append({
+            "hash": snapshot.anchors[line_num - 1],
             "line": line_num,
             "content": line_content.strip(),  # detailed match info?
             "match": m.group(0),
@@ -177,6 +123,8 @@ async def find_in_file(
         "data": {
             "matches": results,
             "count": len(results),
-            "total_matches": len(found)
+            "total_matches": len(found),
+            "path": canonical_path,
+            "file_sha256": snapshot.file_sha256,
         }
     }
