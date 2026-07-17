@@ -23,8 +23,9 @@ Before applying a template:
 1. Check editor state     → mcpforunity://editor/state
 2. Understand the scene   → mcpforunity://scene/gameobject-api
 3. Find what you need     → find_gameobjects or resources
-4. Take action            → tools (manage_gameobject, create_script, script_apply_edits, apply_text_edits, validate_script, delete_script, get_sha, etc.)
-5. Verify results         → read_console, manage_camera(action="screenshot"), resources
+4. Read text targets      → read_text or find_in_file (copy returned hashline anchors)
+5. Take action            → tools (manage_gameobject, create_script, script_apply_edits, apply_text_edits, validate_script, delete_script, etc.)
+6. Verify results         → auto_read, read_console, manage_camera(action="screenshot"), resources
 ```
 
 ## Critical Best Practices
@@ -32,8 +33,8 @@ Before applying a template:
 ### 1. After Writing/Editing Scripts: Wait for Compilation and Check Console
 
 ```python
-# After create_script or script_apply_edits:
-# Both tools already trigger AssetDatabase.ImportAsset + RequestScriptCompilation automatically.
+# After create_script, script_apply_edits, or apply_text_edits:
+# These tools already trigger AssetDatabase import/refresh and request script compilation automatically.
 # No need to call refresh_unity — just wait for compilation to finish, then check console.
 
 # 1. Poll editor state until compilation completes
@@ -43,9 +44,36 @@ Before applying a template:
 read_console(types=["error"], count=10, include_stacktrace=True)
 ```
 
-**Why:** Unity must compile scripts before they're usable. `create_script` and `script_apply_edits` already trigger import and compilation automatically — calling `refresh_unity` afterward is redundant.
+**Why:** Unity must compile scripts before they're usable. Script creation and edit tools already trigger import and compilation automatically — calling `refresh_unity` afterward is redundant.
 
-### 2. Use `batch_execute` for Multiple Operations
+### 2. Read Hashlines Before Text Editing
+
+`apply_text_edits` uses hashline anchors, not line/column coordinates. Read the target range first, then copy the returned anchors into one atomic bulk request.
+
+```python
+read_text(
+    uri="Assets/Scripts/PlayerController.cs",
+    offset=1,
+    limit=120,
+)
+# Each returned line is formatted as HASH│content.
+
+apply_text_edits(
+    uri="Assets/Scripts/PlayerController.cs",
+    changes=[{
+        "hash_range_inclusive": ["ABC123", "DEF456"],
+        "content_lines": ["replacement line 1", "replacement line 2"],
+    }],
+)
+```
+
+- `content_lines=[]` deletes the inclusive range.
+- Use `op="prepend"` or `op="append"` with an optional `anchor` for insertion.
+- Do not include hashline or diff prefixes in `content_lines`.
+- Successful edits return a bounded `auto_read` result by default.
+- On `E_STALE_ANCHOR`, re-read and rebuild the request with new anchors. Never relocate or reuse stale anchors.
+
+### 3. Use `batch_execute` for Multiple Operations
 
 ```python
 # 10-100x faster than sequential calls
@@ -70,7 +98,7 @@ batch_execute(commands=[
 ])
 ```
 
-### 3. Use Screenshots to Verify Visual Results
+### 4. Use Screenshots to Verify Visual Results
 
 ```python
 # Basic screenshot (saves to Assets/, returns file path only)
@@ -118,7 +146,7 @@ manage_camera(action="screenshot_multiview", max_resolution=480)
 manage_camera(action="screenshot", capture_source="scene_view", view_target="Player", include_image=True)
 ```
 
-### 4. Check Console After Major Changes
+### 5. Check Console After Major Changes
 
 ```python
 read_console(
@@ -129,7 +157,7 @@ read_console(
 )
 ```
 
-### 5. Always Check `editor_state` Before Complex Operations
+### 6. Always Check `editor_state` Before Complex Operations
 
 ```python
 # Read mcpforunity://editor/state to check:
@@ -180,7 +208,7 @@ uri="file:///full/path/to/file.cs"
 |----------|-----------|---------|
 | **Scene** | `manage_scene`, `find_gameobjects` | Scene operations, finding objects. Multi-scene editing (additive load, close, set active, move GO between scenes), scene templates (`3d_basic`, `2d_basic`, `empty`, `default`), scene validation with `auto_repair`. For build settings, use `manage_build(action="scenes")`. |
 | **Objects** | `manage_gameobject`, `manage_components` | Creating/modifying GameObjects |
-| **Scripts** | `create_script`, `script_apply_edits`, `validate_script` | C# code management (auto-refreshes on create/edit) |
+| **Scripts** | `read_text`, `create_script`, `apply_text_edits`, `script_apply_edits`, `validate_script` | Hashline text editing for project text files and structured C# editing (auto-refreshes on create/edit) |
 | **Assets** | `manage_asset`, `manage_prefabs` | Asset operations. **Prefab instantiation** is done via `manage_gameobject(action="create", prefab_path="...")`, not `manage_prefabs`. |
 | **Editor** | `manage_editor`, `execute_menu_item`, `read_console` | Editor control, package deployment (`deploy_package`/`restore_package`), undo/redo (`undo`/`redo` actions) |
 | **Testing** | `run_tests`, `get_test_job` | Unity Test Framework |
@@ -268,7 +296,7 @@ set_active_instance(instance="MyProject@abc123")
 | Symptom | Cause | Solution |
 |---------|-------|----------|
 | Tools return "busy" | Compilation in progress | Wait, check `editor_state` |
-| "stale_file" error | File changed since SHA | Re-fetch SHA with `get_sha`, retry |
+| `E_STALE_ANCHOR` | File changed after anchors were read | Call `read_text` again and rebuild the patch with new anchors; never reuse or relocate stale anchors |
 | Connection lost | Domain reload | Wait ~5s, reconnect |
 | Commands fail silently | Wrong instance | Check `set_active_instance` |
 

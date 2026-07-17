@@ -405,26 +405,63 @@ script_apply_edits(
 )
 ```
 
+### read_text
+
+Read a bounded range from any project text file. Hashline output is enabled by default and registers the editable snapshot used by `apply_text_edits`.
+
+```python
+read_text(
+    uri="mcpforunity://path/Assets/Scripts/MyScript.cs",
+    offset=1,       # optional, 1-indexed first line
+    limit=200,      # optional, capped at 500 lines
+    raw=False,      # true returns untagged text and does not register a snapshot
+)
+# data.contents:
+# ABC123│using UnityEngine;
+# DEF456│
+# GhI789│public class MyScript : MonoBehaviour
+# data also includes total_lines, has_more, next_offset, file_sha256,
+# encoding, newline, and protocol metadata.
+```
+
+Empty files have no synthetic anchor. Insert into them with anchorless `prepend` or `append`.
+
 ### apply_text_edits
 
-Apply precise character-position edits (1-indexed lines/columns).
+Apply one or more hashline changes atomically to any project text file. Every change is validated against the same pre-edit snapshot and applied bottom-up without fuzzy relocation.
 
 ```python
 apply_text_edits(
     uri="mcpforunity://path/Assets/Scripts/MyScript.cs",
-    edits=[
+    changes=[
         {
-            "startLine": 10,
-            "startCol": 5,
-            "endLine": 10,
-            "endCol": 20,
-            "newText": "replacement text"
-        }
+            # Inclusive single-line or multi-line replacement.
+            "hash_range_inclusive": ["ABC123", "DEF456"],
+            "content_lines": ["replacement line 1", "replacement line 2"],
+        },
+        {
+            # Insert after a line. Omit anchor to append at end of file.
+            "op": "append",
+            "anchor": "GhI789",
+            "content_lines": ["inserted after the anchor"],
+        },
     ],
-    precondition_sha256="abc123...",  # optional, prevents stale edits
-    strict=True                        # optional, stricter validation
+    options={
+        "refresh": "immediate",  # optional; existing refresh policy is preserved
+        "auto_read": True,       # optional; true by default
+        "auto_read_context": 3,  # optional, capped
+    },
 )
 ```
+
+- Replacement defaults to `op="replace"` when `hash_range_inclusive` is present.
+- `content_lines=[]` deletes the inclusive range.
+- `op="prepend"` and `op="append"` accept an optional `anchor`; omit it for file start/end.
+- Multiple changes are all-or-nothing. Overlap or one invalid member aborts the entire request before writing.
+- Hashline/diff-prefixed content is rejected instead of being written literally.
+- Legacy line/column, LSP range, `oldText/newText`, and `operation` shapes return `E_LEGACY_SHAPE`.
+- Important errors: `E_BAD_SHAPE`, `E_BAD_REF`, `E_STALE_ANCHOR`, `E_OVERLAP`, `E_INVALID_PATCH`, `E_BINARY`, `E_PATH`, `E_PRECONDITION`, and `E_WRITE`.
+- On `E_STALE_ANCHOR`, call `read_text` again and rebuild the request. Do not retry old anchors with a new SHA.
 
 ### validate_script
 
@@ -440,7 +477,7 @@ validate_script(
 
 ### get_sha
 
-Get file hash without content (for preconditions).
+Get file hash without content for diagnostics and metadata checks. Hashline edits obtain and recheck their precondition internally; callers should not use `get_sha` to relocate or retry stale anchors.
 
 ```python
 get_sha(uri="mcpforunity://path/Assets/Scripts/MyScript.cs")
@@ -813,7 +850,7 @@ result = get_test_job(
 
 ### find_in_file
 
-Search file contents with regex.
+Search any project text file with regex. Each result includes the current line's hashline anchor, which can be passed directly to `apply_text_edits`.
 
 ```python
 find_in_file(
@@ -822,7 +859,7 @@ find_in_file(
     max_results=200,
     ignore_case=True
 )
-# Returns: line numbers, content excerpts, match positions
+# Returns: hash, line, content, match positions, path, and file_sha256
 ```
 
 ---
