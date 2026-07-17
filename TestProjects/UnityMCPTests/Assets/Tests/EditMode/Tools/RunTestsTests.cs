@@ -3,6 +3,7 @@ using System.Reflection;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using MCPForUnity.Editor.Helpers;
+using UnityEditor;
 
 namespace MCPForUnityTests.Editor.Tools
 {
@@ -60,6 +61,29 @@ namespace MCPForUnityTests.Editor.Tools
             var err = (ErrorResponse)resultObj;
             Assert.AreEqual(false, err.Success);
             Assert.IsTrue(err.Error.Contains("Unknown test mode", StringComparison.OrdinalIgnoreCase));
+        }
+
+        [Test]
+        public void HandleCommand_WhenCompilationRequestIsPending_ReturnsReadinessError()
+        {
+            const string pendingKey = "MCPForUnity.CompilationRequest.Pending";
+            bool original = SessionState.GetBool(pendingKey, false);
+            SessionState.SetBool(pendingKey, true);
+            try
+            {
+                var resultObj = MCPForUnity.Editor.Tools.RunTests.HandleCommand(new JObject
+                {
+                    ["mode"] = "PlayMode"
+                }).GetAwaiter().GetResult();
+
+                Assert.IsInstanceOf<ErrorResponse>(resultObj);
+                var err = (ErrorResponse)resultObj;
+                Assert.AreEqual("editor_not_ready_for_tests", err.Code);
+            }
+            finally
+            {
+                SessionState.SetBool(pendingKey, original);
+            }
         }
     }
 }

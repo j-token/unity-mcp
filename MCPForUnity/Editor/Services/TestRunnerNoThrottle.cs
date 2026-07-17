@@ -114,6 +114,11 @@ namespace MCPForUnity.Editor.Services
             McpLog.Info("[TestRunnerNoThrottle] Restored Interaction Mode after test run.");
         }
 
+        internal static void RestoreAfterInterruptedRun()
+        {
+            RestoreThrottling();
+        }
+
         private static void ForceEditorToApplyInteractionPrefs()
         {
             try

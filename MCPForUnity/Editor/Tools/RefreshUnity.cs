@@ -59,6 +59,7 @@ namespace MCPForUnity.Editor.Tools
 
                 if (string.Equals(compile, "request", StringComparison.OrdinalIgnoreCase))
                 {
+                    CompilationRequestTracker.MarkRequested();
                     CompilationPipeline.RequestScriptCompilation();
                     compileRequested = true;
                 }

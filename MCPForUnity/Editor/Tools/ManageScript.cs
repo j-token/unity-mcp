@@ -8,6 +8,7 @@ using UnityEditor;
 using UnityEngine;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services;
 using System.Threading;
 using System.Security.Cryptography;
 using System.Text;
@@ -641,7 +642,11 @@ namespace MCPForUnity.Editor.Tools
                     AssetDatabase.Refresh(immediate ? ImportAssetOptions.ForceSynchronousImport : ImportAssetOptions.Default);
                 }
 #if UNITY_EDITOR
-                if (isScript) CompilationPipeline.RequestScriptCompilation();
+                if (isScript)
+                {
+                    CompilationRequestTracker.MarkRequested();
+                    CompilationPipeline.RequestScriptCompilation();
+                }
 #endif
             };
             if (immediate) refresh();
@@ -1147,6 +1152,7 @@ namespace MCPForUnity.Editor.Tools
                         ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate
                     );
 #if UNITY_EDITOR
+                    CompilationRequestTracker.MarkRequested();
                     UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
                 }
@@ -3340,6 +3346,7 @@ namespace MCPForUnity.Editor.Tools
                     AssetDatabase.ImportAsset(sp, ImportAssetOptions.ForceUpdate | ImportAssetOptions.ForceSynchronousImport);
                 }
 #if UNITY_EDITOR
+                CompilationRequestTracker.MarkRequested();
                 UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
                 // Fallback if needed:
@@ -3376,6 +3383,7 @@ namespace MCPForUnity.Editor.Tools
             if (synchronous) opts |= ImportAssetOptions.ForceSynchronousImport;
             AssetDatabase.ImportAsset(sp, opts);
 #if UNITY_EDITOR
+            CompilationRequestTracker.MarkRequested();
             UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
         }

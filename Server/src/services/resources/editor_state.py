@@ -50,6 +50,11 @@ class EditorStateActivity(BaseModel):
 class EditorStateCompilation(BaseModel):
     is_compiling: bool | None = None
     is_domain_reload_pending: bool | None = None
+    is_request_pending: bool | None = None
+    requested_generation: int | None = None
+    completed_generation: int | None = None
+    last_request_unix_ms: int | None = None
+    last_request_completed_unix_ms: int | None = None
     last_compile_started_unix_ms: int | None = None
     last_compile_finished_unix_ms: int | None = None
     last_domain_reload_before_unix_ms: int | None = None
@@ -197,10 +202,16 @@ def _enrich_advice_and_staleness(state_v2: dict[str, Any]) -> dict[str, Any]:
         blocking.append("compiling")
     if compilation.get("is_domain_reload_pending") is True:
         blocking.append("domain_reload")
-    if tests.get("is_running") is True:
+    if compilation.get("is_request_pending") is True:
+        blocking.append("compile_requested")
+    if tests.get("is_running") is True or tests.get("current_job_id"):
         blocking.append("running_tests")
     if refresh.get("is_refresh_in_progress") is True:
         blocking.append("asset_refresh")
+    editor = state_v2.get("editor") or {}
+    play_mode = editor.get("play_mode") or {} if isinstance(editor, dict) else {}
+    if play_mode.get("is_playing") is True or play_mode.get("is_changing") is True:
+        blocking.append("playmode_transition")
     if is_stale:
         blocking.append("stale_status")
 

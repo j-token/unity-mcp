@@ -211,7 +211,7 @@ uri="file:///full/path/to/file.cs"
 | **Scripts** | `read_text`, `create_script`, `apply_text_edits`, `script_apply_edits`, `validate_script` | Hashline text editing for project text files and structured C# editing (auto-refreshes on create/edit) |
 | **Assets** | `manage_asset`, `manage_prefabs` | Asset operations. **Prefab instantiation** is done via `manage_gameobject(action="create", prefab_path="...")`, not `manage_prefabs`. |
 | **Editor** | `manage_editor`, `execute_menu_item`, `read_console` | Editor control, package deployment (`deploy_package`/`restore_package`), undo/redo (`undo`/`redo` actions) |
-| **Testing** | `run_tests`, `get_test_job` | Unity Test Framework |
+| **Testing** | `run_tests`, `get_test_job`, `cancel_test_job` | Unity Test Framework |
 | **Batch** | `batch_execute` | Parallel/bulk operations |
 | **Camera** | `manage_camera` | Camera management (Unity Camera + Cinemachine). **Tier 1** (always available): create, target, lens, priority, list, screenshot. **Tier 2** (requires `com.unity.cinemachine`): brain, body/aim/noise pipeline, extensions, blending, force/release. 7 presets: follow, third_person, freelook, dolly, static, top_down, side_scroller. Resource: `mcpforunity://scene/cameras`. Use `ping` to check Cinemachine availability. See [tools-reference.md](references/tools-reference.md#camera-tools). |
 | **Graphics** | `manage_graphics` | Rendering and post-processing management. 33 actions across 5 groups: **Volume** (create/configure volumes and effects, URP/HDRP), **Bake** (lightmaps, light probes, reflection probes, Edit mode only), **Stats** (draw calls, batches, memory), **Pipeline** (quality levels, pipeline settings), **Features** (URP renderer features: add, remove, toggle, reorder). Resources: `mcpforunity://scene/volumes`, `mcpforunity://rendering/stats`, `mcpforunity://pipeline/renderer-features`. Use `ping` to check pipeline status. See [tools-reference.md](references/tools-reference.md#graphics-tools). |
@@ -263,6 +263,9 @@ job_id = result["job_id"]
 
 # 2. Poll for completion
 result = get_test_job(job_id=job_id, wait_timeout=60, include_failed_tests=True)
+
+# 3. Cancel safely when needed
+cancel_test_job(job_id=job_id)
 ```
 
 ## Pagination Pattern

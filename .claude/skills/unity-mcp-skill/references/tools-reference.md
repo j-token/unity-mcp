@@ -825,10 +825,13 @@ result = run_tests(
     category_names=["Unit"],     # NUnit categories
     assembly_names=["Tests"],    # assembly filter
     include_failed_tests=True,   # include failure details
-    include_details=False        # include all test details
+    include_details=False,       # include all test details
+    init_timeout=120000          # PlayMode initialization timeout
 )
 # Returns: {"job_id": "abc123", ...}
 ```
+
+`run_tests` waits for pending MCP-requested compilation, domain reload, asset refresh, Play Mode transitions, and existing/ghost jobs before starting.
 
 ### get_test_job
 
@@ -841,7 +844,15 @@ result = get_test_job(
     include_failed_tests=True,
     include_details=False
 )
-# Returns: {"status": "complete"|"running"|"failed", "results": {...}}
+# Returns phase/run_guid plus status: running|succeeded|failed|cancelled
+```
+
+### cancel_test_job
+
+Cancel an MCP-owned Unity Test Runner job. The tool uses Unity's run GUID when a real run exists and reconciles an initialization job orphaned by assembly reload.
+
+```python
+cancel_test_job(job_id="abc123")
 ```
 
 ---

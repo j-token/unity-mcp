@@ -40,6 +40,7 @@ namespace MCPForUnity.Editor.Services
         private static bool _lastTrackedIsPaused;
         private static bool _lastTrackedIsUpdating;
         private static bool _lastTrackedTestsRunning;
+        private static bool _lastTrackedCompilationRequestPending;
         private static string _lastTrackedActivityPhase;
 
         private static JObject _cached;
@@ -153,6 +154,21 @@ namespace MCPForUnity.Editor.Services
 
             [JsonProperty("is_domain_reload_pending")]
             public bool? IsDomainReloadPending { get; set; }
+
+            [JsonProperty("is_request_pending")]
+            public bool? IsRequestPending { get; set; }
+
+            [JsonProperty("requested_generation")]
+            public int RequestedGeneration { get; set; }
+
+            [JsonProperty("completed_generation")]
+            public int CompletedGeneration { get; set; }
+
+            [JsonProperty("last_request_unix_ms")]
+            public long? LastRequestUnixMs { get; set; }
+
+            [JsonProperty("last_request_completed_unix_ms")]
+            public long? LastRequestCompletedUnixMs { get; set; }
 
             [JsonProperty("last_compile_started_unix_ms")]
             public long? LastCompileStartedUnixMs { get; set; }
@@ -309,14 +325,15 @@ namespace MCPForUnity.Editor.Services
             bool isPlaying = EditorApplication.isPlaying;
             bool isPaused = EditorApplication.isPaused;
             bool isUpdating = EditorApplication.isUpdating;
-            bool testsRunning = TestRunStatus.IsRunning;
+            bool testsRunning = TestRunStatus.IsRunning || TestJobManager.HasRunningJob;
+            bool compilationRequestPending = CompilationRequestTracker.IsPending;
 
             var activityPhase = "idle";
             if (testsRunning)
             {
                 activityPhase = "running_tests";
             }
-            else if (isCompiling)
+            else if (isCompiling || compilationRequestPending)
             {
                 activityPhase = "compiling";
             }
@@ -341,6 +358,7 @@ namespace MCPForUnity.Editor.Services
                 || _lastTrackedIsPaused != isPaused
                 || _lastTrackedIsUpdating != isUpdating
                 || _lastTrackedTestsRunning != testsRunning
+                || _lastTrackedCompilationRequestPending != compilationRequestPending
                 || _lastTrackedActivityPhase != activityPhase;
 
             if (!hasChanges)
@@ -358,13 +376,14 @@ namespace MCPForUnity.Editor.Services
             _lastTrackedIsPaused = isPaused;
             _lastTrackedIsUpdating = isUpdating;
             _lastTrackedTestsRunning = testsRunning;
+            _lastTrackedCompilationRequestPending = compilationRequestPending;
             _lastTrackedActivityPhase = activityPhase;
 
             _lastUpdateTimeSinceStartup = now;
             ForceUpdate("tick");
         }
 
-        private static void ForceUpdate(string reason)
+        internal static void ForceUpdate(string reason)
         {
             lock (LockObj)
             {
@@ -378,6 +397,7 @@ namespace MCPForUnity.Editor.Services
             _observedUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
             bool isCompiling = GetActualIsCompiling();
+            bool compilationRequestPending = CompilationRequestTracker.IsPending;
             if (isCompiling && !_lastIsCompiling)
             {
                 _lastCompileStartedUnixMs = _observedUnixMs;
@@ -392,7 +412,7 @@ namespace MCPForUnity.Editor.Services
             string scenePath = string.IsNullOrEmpty(scene.path) ? null : scene.path;
             string sceneGuid = !string.IsNullOrEmpty(scenePath) ? AssetDatabase.AssetPathToGUID(scenePath) : null;
 
-            bool testsRunning = TestRunStatus.IsRunning;
+            bool testsRunning = TestRunStatus.IsRunning || TestJobManager.HasRunningJob;
             var testsMode = TestRunStatus.Mode?.ToString();
             string currentJobId = TestJobManager.CurrentJobId;
             bool isFocused = InternalEditorUtility.isApplicationActive;
@@ -402,7 +422,7 @@ namespace MCPForUnity.Editor.Services
             {
                 activityPhase = "running_tests";
             }
-            else if (isCompiling)
+            else if (isCompiling || compilationRequestPending)
             {
                 activityPhase = "compiling";
             }
@@ -458,6 +478,11 @@ namespace MCPForUnity.Editor.Services
                 {
                     IsCompiling = isCompiling,
                     IsDomainReloadPending = _domainReloadPending,
+                    IsRequestPending = compilationRequestPending,
+                    RequestedGeneration = CompilationRequestTracker.RequestedGeneration,
+                    CompletedGeneration = CompilationRequestTracker.CompletedGeneration,
+                    LastRequestUnixMs = CompilationRequestTracker.RequestedUnixMs,
+                    LastRequestCompletedUnixMs = CompilationRequestTracker.CompletedUnixMs,
                     LastCompileStartedUnixMs = _lastCompileStartedUnixMs,
                     LastCompileFinishedUnixMs = _lastCompileFinishedUnixMs,
                     LastDomainReloadBeforeUnixMs = _domainReloadBeforeUnixMs,

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
 using Newtonsoft.Json;
@@ -14,7 +15,8 @@ namespace MCPForUnity.Editor.Services
     {
         Running,
         Succeeded,
-        Failed
+        Failed,
+        Cancelled
     }
 
     internal sealed class TestJobFailure
@@ -41,6 +43,9 @@ namespace MCPForUnity.Editor.Services
         public string Error { get; set; }
         public TestRunResult Result { get; set; }
         public long InitTimeoutMs { get; set; }
+        public string RunGuid { get; set; }
+        public string Phase { get; set; }
+        public bool RunStartedObserved { get; set; }
     }
 
     /// <summary>
@@ -115,6 +120,10 @@ namespace MCPForUnity.Editor.Services
 
                 _currentJobId = null;
             }
+            if (cleared)
+            {
+                RestoreAfterInterruptedRun();
+            }
             PersistToSessionState(force: true);
             return cleared;
         }
@@ -142,6 +151,9 @@ namespace MCPForUnity.Editor.Services
             public List<TestJobFailure> failures_so_far { get; set; }
             public string error { get; set; }
             public long init_timeout_ms { get; set; }
+            public string run_guid { get; set; }
+            public string phase { get; set; }
+            public bool run_started_observed { get; set; }
         }
 
         private static TestJobStatus ParseStatus(string status)
@@ -156,6 +168,7 @@ namespace MCPForUnity.Editor.Services
             {
                 "succeeded" => TestJobStatus.Succeeded,
                 "failed" => TestJobStatus.Failed,
+                "cancelled" => TestJobStatus.Cancelled,
                 _ => TestJobStatus.Running
             };
         }
@@ -178,6 +191,7 @@ namespace MCPForUnity.Editor.Services
                     return;
                 }
 
+                bool interruptedBeforeStart = false;
                 lock (LockObj)
                 {
                     Jobs.Clear();
@@ -205,6 +219,9 @@ namespace MCPForUnity.Editor.Services
                             FailuresSoFar = pj.failures_so_far ?? new List<TestJobFailure>(),
                             Error = pj.error,
                             InitTimeoutMs = pj.init_timeout_ms,
+                            RunGuid = pj.run_guid,
+                            Phase = string.IsNullOrWhiteSpace(pj.phase) ? "initializing" : pj.phase,
+                            RunStartedObserved = pj.run_started_observed,
                             // Intentionally not persisted to avoid ballooning SessionState.
                             Result = null
                         };
@@ -224,17 +241,33 @@ namespace MCPForUnity.Editor.Services
                         if (currentJob.Status == TestJobStatus.Running)
                         {
                             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                            if (!currentJob.RunStartedObserved)
+                            {
+                                currentJob.Status = TestJobStatus.Failed;
+                                currentJob.Error = "Test initialization was interrupted by assembly reload";
+                                currentJob.Phase = "orphaned";
+                                currentJob.FinishedUnixMs = now;
+                                currentJob.LastUpdateUnixMs = now;
+                                _currentJobId = null;
+                                interruptedBeforeStart = true;
+                            }
                             long staleCutoffMs = 5 * 60 * 1000; // 5 minutes
-                            if (now - currentJob.LastUpdateUnixMs > staleCutoffMs)
+                            if (!interruptedBeforeStart && now - currentJob.LastUpdateUnixMs > staleCutoffMs)
                             {
                                 McpLog.Warn($"[TestJobManager] Clearing stale job {_currentJobId} (last update {(now - currentJob.LastUpdateUnixMs) / 1000}s ago)");
                                 currentJob.Status = TestJobStatus.Failed;
                                 currentJob.Error = "Job orphaned after domain reload";
+                                currentJob.Phase = "orphaned";
                                 currentJob.FinishedUnixMs = now;
                                 _currentJobId = null;
                             }
                         }
                     }
+                }
+                if (interruptedBeforeStart)
+                {
+                    RestoreAfterInterruptedRun();
+                    PersistToSessionState(force: true);
                 }
             }
             catch (Exception ex)
@@ -278,7 +311,10 @@ namespace MCPForUnity.Editor.Services
                             last_finished_unix_ms = j.LastFinishedUnixMs,
                             failures_so_far = (j.FailuresSoFar ?? new List<TestJobFailure>()).Take(FailureCap).ToList(),
                             error = j.Error,
-                            init_timeout_ms = j.InitTimeoutMs
+                            init_timeout_ms = j.InitTimeoutMs,
+                            run_guid = j.RunGuid,
+                            phase = j.Phase,
+                            run_started_observed = j.RunStartedObserved
                         })
                         .ToList();
 
@@ -326,7 +362,10 @@ namespace MCPForUnity.Editor.Services
                 FailuresSoFar = new List<TestJobFailure>(),
                 Error = null,
                 Result = null,
-                InitTimeoutMs = initTimeoutMs
+                InitTimeoutMs = initTimeoutMs,
+                RunGuid = null,
+                Phase = "initializing",
+                RunStartedObserved = false
             };
 
             // Single lock scope for check-and-set to avoid TOCTOU race
@@ -376,10 +415,14 @@ namespace MCPForUnity.Editor.Services
 
                 job.LastUpdateUnixMs = now;
                 job.FinishedUnixMs = now;
-                job.Status = resultPayload != null && resultPayload.Failed > 0
-                    ? TestJobStatus.Failed
-                    : TestJobStatus.Succeeded;
+                bool wasCancelling = string.Equals(job.Phase, "cancelling", StringComparison.Ordinal);
+                job.Status = wasCancelling
+                    ? TestJobStatus.Cancelled
+                    : resultPayload != null && resultPayload.Failed > 0
+                        ? TestJobStatus.Failed
+                        : TestJobStatus.Succeeded;
                 job.Error = null;
+                job.Phase = wasCancelling ? "cancelled" : "completed";
                 job.Result = resultPayload;
                 job.CurrentTestFullName = null;
                 _currentJobId = null;
@@ -399,6 +442,8 @@ namespace MCPForUnity.Editor.Services
 
                 job.LastUpdateUnixMs = now;
                 job.TotalTests = totalTests;
+                job.RunStartedObserved = true;
+                job.Phase = "running";
                 job.CompletedTests = 0;
                 job.CurrentTestFullName = null;
                 job.CurrentTestStartedUnixMs = null;
@@ -507,6 +552,7 @@ namespace MCPForUnity.Editor.Services
                         McpLog.Warn($"[TestJobManager] Job {jobId} failed to initialize within {initTimeout}ms, auto-failing");
                         job.Status = TestJobStatus.Failed;
                         job.Error = "Test job failed to initialize (tests did not start within timeout)";
+                        job.Phase = "orphaned";
                         job.FinishedUnixMs = now;
                         job.LastUpdateUnixMs = now;
                         if (_currentJobId == jobId)
@@ -549,6 +595,8 @@ namespace MCPForUnity.Editor.Services
                 job_id = job.JobId,
                 status = job.Status.ToString().ToLowerInvariant(),
                 mode = job.Mode,
+                phase = job.Phase,
+                run_guid = job.RunGuid,
                 started_unix_ms = job.StartedUnixMs,
                 finished_unix_ms = job.FinishedUnixMs,
                 last_update_unix_ms = job.LastUpdateUnixMs,
@@ -658,12 +706,14 @@ namespace MCPForUnity.Editor.Services
                 {
                     existing.Status = TestJobStatus.Failed;
                     existing.Error = task.Exception?.GetBaseException()?.Message ?? "Unknown test job failure";
+                    existing.Phase = "completed";
                     existing.Result = null;
                 }
                 else if (task.IsCanceled)
                 {
-                    existing.Status = TestJobStatus.Failed;
+                    existing.Status = TestJobStatus.Cancelled;
                     existing.Error = "Test job canceled";
+                    existing.Phase = "cancelled";
                     existing.Result = null;
                 }
                 else
@@ -673,6 +723,7 @@ namespace MCPForUnity.Editor.Services
                         ? TestJobStatus.Failed
                         : TestJobStatus.Succeeded;
                     existing.Error = null;
+                    existing.Phase = "completed";
                     existing.Result = result;
                 }
 
@@ -682,6 +733,132 @@ namespace MCPForUnity.Editor.Services
                 }
             }
             PersistToSessionState(force: true);
+        }
+
+        public static void OnRunGuidAssigned(string runGuid)
+        {
+            if (string.IsNullOrWhiteSpace(runGuid))
+            {
+                return;
+            }
+
+            lock (LockObj)
+            {
+                if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                {
+                    return;
+                }
+
+                job.RunGuid = runGuid;
+                job.LastUpdateUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+            PersistToSessionState(force: true);
+        }
+
+        public static bool CancelJob(string jobId, out string error)
+        {
+            error = null;
+            TestJob job;
+            lock (LockObj)
+            {
+                if (string.IsNullOrWhiteSpace(jobId) || !Jobs.TryGetValue(jobId, out job))
+                {
+                    error = "Unknown job_id.";
+                    return false;
+                }
+                if (job.Status != TestJobStatus.Running)
+                {
+                    error = "Test job is not running.";
+                    return false;
+                }
+            }
+
+            bool requested = !string.IsNullOrWhiteSpace(job.RunGuid)
+                && TryCancelTestRun(job.RunGuid);
+            if (requested)
+            {
+                lock (LockObj)
+                {
+                    job.Phase = "cancelling";
+                    job.LastUpdateUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                }
+                PersistToSessionState(force: true);
+                return true;
+            }
+
+            if (!TestRunStatus.IsRunning && !job.RunStartedObserved)
+            {
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                lock (LockObj)
+                {
+                    job.Status = TestJobStatus.Cancelled;
+                    job.Error = "Orphaned test initialization cancelled";
+                    job.Phase = "cancelled";
+                    job.FinishedUnixMs = now;
+                    job.LastUpdateUnixMs = now;
+                    if (_currentJobId == jobId)
+                    {
+                        _currentJobId = null;
+                    }
+                }
+                RestoreAfterInterruptedRun();
+                PersistToSessionState(force: true);
+                return true;
+            }
+
+            error = "Unity Test Runner did not accept the cancellation request.";
+            return false;
+        }
+
+        private static bool TryCancelTestRun(string runGuid)
+        {
+            // Test Framework 1.1 exposes cancellation differently from newer
+            // package versions. Reflection keeps the package compatible with the
+            // Unity 2021+ support matrix while still using the GUID overload when
+            // it is available.
+            MethodInfo method = typeof(TestRunnerApi).GetMethod(
+                "CancelTestRun",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                null,
+                new[] { typeof(string) },
+                null);
+            object[] arguments = { runGuid };
+            if (method == null)
+            {
+                method = typeof(TestRunnerApi).GetMethod(
+                    "CancelTestRun",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                    null,
+                    Type.EmptyTypes,
+                    null);
+                arguments = null;
+            }
+            if (method == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                object result = method.Invoke(null, arguments);
+                return !(result is bool accepted) || accepted;
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[TestJobManager] Test cancellation failed: {ex.GetBaseException().Message}");
+                return false;
+            }
+        }
+
+        private static void RestoreAfterInterruptedRun()
+        {
+            TestRunStatus.MarkFinished();
+            TestRunnerNoThrottle.RestoreAfterInterruptedRun();
+            if (PlayModeOptionsGuard.IsPending)
+            {
+                PlayModeOptionsGuard.Restore();
+            }
+            EditorStateCache.ForceUpdate("test_run_interrupted");
         }
     }
 }

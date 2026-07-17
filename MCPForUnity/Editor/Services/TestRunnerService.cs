@@ -246,7 +246,8 @@ namespace MCPForUnity.Editor.Services
                     TestRunnerNoThrottle.ApplyNoThrottlingPreemptive();
                 }
 
-                _testRunnerApi.Execute(settings);
+                string runGuid = _testRunnerApi.Execute(settings);
+                TestJobManager.OnRunGuidAssigned(runGuid);
 
                 runTask = _runCompletionSource.Task;
             }
