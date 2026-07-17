@@ -57,3 +57,20 @@ async def test_editor_state_v2_is_registered_and_has_contract_fields(monkeypatch
     assert "staleness" in data
 
 
+def test_editor_state_advice_blocks_pending_compile_and_ghost_job():
+    from services.resources.editor_state import _enrich_advice_and_staleness
+
+    state = {
+        "observed_at_unix_ms": 9999999999999,
+        "compilation": {"is_request_pending": True},
+        "tests": {"is_running": False, "current_job_id": "ghost-job"},
+        "editor": {"play_mode": {"is_playing": False, "is_changing": False}},
+        "assets": {"refresh": {"is_refresh_in_progress": False}},
+    }
+
+    result = _enrich_advice_and_staleness(state)
+    assert result["advice"]["ready_for_tools"] is False
+    assert "compile_requested" in result["advice"]["blocking_reasons"]
+    assert "running_tests" in result["advice"]["blocking_reasons"]
+
+

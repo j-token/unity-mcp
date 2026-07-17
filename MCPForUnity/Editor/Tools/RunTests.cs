@@ -4,6 +4,7 @@ using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Resources.Tests;
 using MCPForUnity.Editor.Services;
 using Newtonsoft.Json.Linq;
+using UnityEditor;
 using UnityEditor.TestTools.TestRunner.Api;
 
 namespace MCPForUnity.Editor.Tools
@@ -38,6 +39,16 @@ namespace MCPForUnity.Editor.Tools
                 if (!ModeParser.TryParse(modeStr, out var parsedMode, out var parseError))
                 {
                     return Task.FromResult<object>(new ErrorResponse(parseError));
+                }
+
+                if (CompilationRequestTracker.IsPending
+                    || EditorStateCache.GetActualIsCompiling()
+                    || EditorApplication.isUpdating
+                    || EditorApplication.isPlayingOrWillChangePlaymode)
+                {
+                    return Task.FromResult<object>(new ErrorResponse(
+                        "editor_not_ready_for_tests",
+                        new { reason = "editor_not_ready_for_tests", retry_after_ms = 500 }));
                 }
 
                 var p = new ToolParams(@params);

@@ -61,6 +61,8 @@ namespace MCPForUnityTests.Editor.Services
             jobs?.Remove("test-init-timeout-job");
             jobs?.Remove("test-init-timeout-default");
             jobs?.Remove("test-init-timeout-persist");
+            jobs?.Remove("test-reload-orphan");
+            jobs?.Remove("test-cancel-orphan");
             // Flush cleaned state to SessionState so synthetic jobs don't survive domain reloads.
             // The persist test writes to SessionState; without this, the stub job would be
             // restored on the next [InitializeOnLoadMethod] and pollute later test runs.
@@ -163,6 +165,63 @@ namespace MCPForUnityTests.Editor.Services
             var restoredTimeout = (long)_testJobType.GetProperty("InitTimeoutMs").GetValue(restoredJob);
             Assert.AreEqual(90_000L, restoredTimeout,
                 "InitTimeoutMs should survive persist/restore cycle");
+        }
+
+        [Test]
+        public void Restore_RunningJobWithoutRunStarted_MarksItOrphaned()
+        {
+            var jobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var job = Activator.CreateInstance(_testJobType);
+            _testJobType.GetProperty("JobId").SetValue(job, "test-reload-orphan");
+            _testJobType.GetProperty("Status").SetValue(job, TestJobStatus.Running);
+            _testJobType.GetProperty("Mode").SetValue(job, "PlayMode");
+            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now);
+            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now);
+            _testJobType.GetProperty("TotalTests").SetValue(job, null);
+            _testJobType.GetProperty("InitTimeoutMs").SetValue(job, 120_000L);
+            _testJobType.GetProperty("RunStartedObserved").SetValue(job, false);
+            _testJobType.GetProperty("Phase").SetValue(job, "initializing");
+            _testJobType.GetProperty("FailuresSoFar").SetValue(job, new List<TestJobFailure>());
+            jobs["test-reload-orphan"] = job;
+            _currentJobIdField.SetValue(null, "test-reload-orphan");
+
+            _persistMethod.Invoke(null, new object[] { true });
+            jobs.Remove("test-reload-orphan");
+            _currentJobIdField.SetValue(null, null);
+            _restoreMethod.Invoke(null, null);
+
+            var restored = (_jobsField.GetValue(null) as System.Collections.IDictionary)["test-reload-orphan"];
+            Assert.AreEqual(
+                TestJobStatus.Failed,
+                (TestJobStatus)_testJobType.GetProperty("Status").GetValue(restored));
+            Assert.AreEqual("orphaned", _testJobType.GetProperty("Phase").GetValue(restored));
+            Assert.IsNull(_currentJobIdField.GetValue(null));
+        }
+
+        [Test]
+        public void CancelJob_OrphanedInitialization_ClearsCurrentJob()
+        {
+            var jobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var job = Activator.CreateInstance(_testJobType);
+            _testJobType.GetProperty("JobId").SetValue(job, "test-cancel-orphan");
+            _testJobType.GetProperty("Status").SetValue(job, TestJobStatus.Running);
+            _testJobType.GetProperty("Mode").SetValue(job, "PlayMode");
+            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now);
+            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now);
+            _testJobType.GetProperty("RunStartedObserved").SetValue(job, false);
+            _testJobType.GetProperty("Phase").SetValue(job, "initializing");
+            _testJobType.GetProperty("FailuresSoFar").SetValue(job, new List<TestJobFailure>());
+            jobs["test-cancel-orphan"] = job;
+            _currentJobIdField.SetValue(null, "test-cancel-orphan");
+
+            bool cancelled = TestJobManager.CancelJob("test-cancel-orphan", out string error);
+
+            Assert.IsTrue(cancelled, error);
+            Assert.AreEqual(TestJobStatus.Cancelled, _testJobType.GetProperty("Status").GetValue(job));
+            Assert.AreEqual("cancelled", _testJobType.GetProperty("Phase").GetValue(job));
+            Assert.IsNull(_currentJobIdField.GetValue(null));
         }
     }
 }

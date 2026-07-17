@@ -131,6 +131,8 @@ class GetTestJobData(BaseModel):
     job_id: str
     status: str
     mode: str | None = None
+    phase: str | None = None
+    run_guid: str | None = None
     started_unix_ms: int | None = None
     finished_unix_ms: int | None = None
     last_update_unix_ms: int | None = None
@@ -141,6 +143,15 @@ class GetTestJobData(BaseModel):
 
 class GetTestJobResponse(MCPResponse):
     data: GetTestJobData | None = None
+
+
+class CancelTestJobData(BaseModel):
+    job_id: str
+    status: str
+
+
+class CancelTestJobResponse(MCPResponse):
+    data: CancelTestJobData | None = None
 
 
 @mcp_for_unity_tool(
@@ -176,7 +187,13 @@ async def run_tests(
 
     unity_instance = await get_unity_instance_from_context(ctx)
 
-    gate = await preflight(ctx, requires_no_tests=True, wait_for_no_compile=True, refresh_if_dirty=True)
+    gate = await preflight(
+        ctx,
+        requires_no_tests=True,
+        wait_for_no_compile=True,
+        refresh_if_dirty=True,
+        require_test_readiness=True,
+    )
     if isinstance(gate, MCPResponse):
         return gate
 
@@ -218,6 +235,35 @@ async def run_tests(
             return MCPResponse(**response)
         return RunTestsStartResponse(**response)
     return MCPResponse(success=False, error=str(response))
+
+
+@mcp_for_unity_tool(
+    group="testing",
+    description="Cancels an MCP-owned Unity test job and reconciles orphaned initialization state.",
+    annotations=ToolAnnotations(
+        title="Cancel Test Job",
+        destructiveHint=True,
+    ),
+)
+async def cancel_test_job(
+    ctx: Context,
+    job_id: Annotated[str, "Job id returned by run_tests"],
+) -> CancelTestJobResponse | MCPResponse:
+    if not job_id or not job_id.strip():
+        return MCPResponse(success=False, error="job_id is required")
+
+    unity_instance = await get_unity_instance_from_context(ctx)
+    response = await unity_transport.send_with_unity_instance(
+        async_send_command_with_retry,
+        unity_instance,
+        "cancel_test_job",
+        {"job_id": job_id.strip()},
+    )
+    if not isinstance(response, dict):
+        return MCPResponse(success=False, error=str(response))
+    if not response.get("success", True):
+        return MCPResponse(**response)
+    return CancelTestJobResponse(**response)
 
 
 @mcp_for_unity_tool(

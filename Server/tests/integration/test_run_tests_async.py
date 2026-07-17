@@ -114,3 +114,29 @@ async def test_get_test_job_forwards_job_id(monkeypatch):
     assert resp.success is True
     assert resp.data is not None
     assert resp.data.job_id == "job-1"
+
+
+@pytest.mark.asyncio
+async def test_cancel_test_job_forwards_job_id(monkeypatch):
+    from services.tools.run_tests import cancel_test_job
+
+    captured = {}
+
+    async def fake_send_with_unity_instance(send_fn, unity_instance, command_type, params, **kwargs):
+        captured["command_type"] = command_type
+        captured["params"] = params
+        return {
+            "success": True,
+            "data": {"job_id": params["job_id"], "status": "cancelling"},
+        }
+
+    import services.tools.run_tests as mod
+    monkeypatch.setattr(
+        mod.unity_transport, "send_with_unity_instance", fake_send_with_unity_instance)
+
+    resp = await cancel_test_job(DummyContext(), job_id=" job-1 ")
+    assert captured["command_type"] == "cancel_test_job"
+    assert captured["params"] == {"job_id": "job-1"}
+    assert resp.success is True
+    assert resp.data is not None
+    assert resp.data.status == "cancelling"

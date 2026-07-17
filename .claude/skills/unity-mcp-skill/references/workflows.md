@@ -107,17 +107,30 @@ batch_execute(commands=[
 ])
 ```
 
-### Script Overwrites with `manage_script(action="update")`
+### Rewrite Existing Text with Hashline Anchors
 
-When a generated script needs to be rewritten (e.g., to add auto-wiring logic), use `update` instead of deleting and recreating:
+Read the target before rewriting it. For files larger than one page, follow `next_offset` until you have the first and last anchors of the intended range.
 
 ```python
-manage_script(
-    action="update",
-    path="Assets/Scripts/MyScript.cs",
-    contents="using UnityEngine;\n\npublic class MyScript : MonoBehaviour { ... }"
+read_text(
+    uri="Assets/Scripts/MyScript.cs",
+    offset=1,
+    limit=500,
 )
-# manage_script update auto-triggers import + compile — just wait and check console
+# Copy the first and last HASH values from the returned HASH│content lines.
+
+apply_text_edits(
+    uri="Assets/Scripts/MyScript.cs",
+    changes=[{
+        "hash_range_inclusive": ["FIRST1", "LAST99"],
+        "content_lines": [
+            "using UnityEngine;",
+            "",
+            "public class MyScript : MonoBehaviour { }",
+        ],
+    }],
+)
+# apply_text_edits triggers import + compile and returns a bounded auto_read.
 # Read mcpforunity://editor/state → wait until is_compiling == false
 read_console(types=["error"], count=10)
 ```
@@ -258,41 +271,39 @@ else:
 ### Edit Existing Script Safely
 
 ```python
-# 1. Get current SHA
-sha_info = get_sha(uri="mcpforunity://path/Assets/Scripts/PlayerController.cs")
-
-# 2. Find the method to edit
-matches = find_in_file(
+# 1. Read only the range containing the target method.
+read_text(
     uri="mcpforunity://path/Assets/Scripts/PlayerController.cs",
-    pattern="void Update\\(\\)"
+    offset=20,
+    limit=40,
 )
 
-# 3. Apply structured edit
-script_apply_edits(
-    name="PlayerController",
-    path="Assets/Scripts",
-    edits=[{
-        "op": "replace_method",
-        "methodName": "Update",
-        "replacement": '''void Update()
-    {
-        float h = Input.GetAxis("Horizontal");
-        float v = Input.GetAxis("Vertical");
-        transform.Translate(new Vector3(h, 0, v) * speed * Time.deltaTime);
-    }'''
-    }]
+# 2. Copy the inclusive start/end hashes and submit one atomic change.
+apply_text_edits(
+    uri="mcpforunity://path/Assets/Scripts/PlayerController.cs",
+    changes=[{
+        "hash_range_inclusive": ["START1", "END999"],
+        "content_lines": [
+            "    void Update()",
+            "    {",
+            "        float h = Input.GetAxis(\"Horizontal\");",
+            "        float v = Input.GetAxis(\"Vertical\");",
+            "        transform.Translate(new Vector3(h, 0, v) * speed * Time.deltaTime);",
+            "    }",
+        ],
+    }],
 )
 
-# 4. Validate
+# 3. Validate
 validate_script(
     uri="mcpforunity://path/Assets/Scripts/PlayerController.cs",
     level="standard"
 )
 
-# 5. Wait for compilation (script_apply_edits auto-triggers import + compile)
+# 4. Wait for compilation (apply_text_edits auto-triggers import + compile)
 # Read mcpforunity://editor/state → wait until is_compiling == false
 
-# 6. Check console
+# 5. Check console
 read_console(types=["error"], count=10)
 ```
 
@@ -1876,7 +1887,7 @@ Use `deploy_package` to copy your local MCPForUnity source into the project's in
 # Prerequisites: Set the MCPForUnity source path in Advanced Settings first.
 
 # 1. Make code changes (e.g., edit C# tools)
-# script_apply_edits or create_script as needed
+# read_text + apply_text_edits, script_apply_edits, or create_script as needed
 
 # 2. Deploy the updated package (copies source → installed package, creates backup)
 manage_editor(action="deploy_package")
@@ -2058,18 +2069,32 @@ batch_execute(commands=commands, fail_fast=False)
 
 ## Error Recovery Patterns
 
-### Stale File Recovery
+### Stale Anchor Recovery
 
 ```python
-try:
-    apply_text_edits(uri=script_uri, edits=[...], precondition_sha256=old_sha)
-except Exception as e:
-    if "stale_file" in str(e):
-        # Re-fetch SHA
-        new_sha = get_sha(uri=script_uri)
-        # Retry with new SHA
-        apply_text_edits(uri=script_uri, edits=[...], precondition_sha256=new_sha["sha256"])
+result = apply_text_edits(
+    uri=script_uri,
+    changes=[{
+        "hash_range_inclusive": ["OLD111", "OLD222"],
+        "content_lines": ["replacement"],
+    }],
+)
+
+if result.get("code") == "E_STALE_ANCHOR":
+    # The file changed after the anchors were read. The old request is discarded.
+    refreshed = read_text(uri=script_uri, offset=target_offset, limit=target_limit)
+
+    # Re-evaluate the current text, copy new anchors, and build a new request.
+    result = apply_text_edits(
+        uri=script_uri,
+        changes=[{
+            "hash_range_inclusive": ["NEW111", "NEW222"],
+            "content_lines": ["replacement rebuilt for the current text"],
+        }],
+    )
 ```
+
+Never retry an old patch by supplying a new SHA, and never fuzzy-match or silently relocate stale anchors.
 
 ### Domain Reload Recovery
 

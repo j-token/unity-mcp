@@ -8,8 +8,10 @@ using UnityEditor;
 using UnityEngine;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services;
 using System.Threading;
 using System.Security.Cryptography;
+using System.Text;
 
 #if USE_ROSLYN
 using Microsoft.CodeAnalysis;
@@ -54,6 +56,171 @@ namespace MCPForUnity.Editor.Tools
     [McpForUnityTool("manage_script", AutoRegister = false)]
     public static class ManageScript
     {
+        private const int MaxHashlinePayloadBytes = 4 * 1024 * 1024;
+
+        private sealed class TextFileState
+        {
+            public byte[] Bytes;
+            public string Contents;
+            public Encoding Encoding;
+            public string EncodingName;
+            public bool HasBom;
+            public string Newline;
+            public string Sha256;
+        }
+
+        private static bool TryResolveProjectFile(string input, out string fullPath, out string relativePath)
+        {
+            fullPath = null;
+            relativePath = null;
+            if (string.IsNullOrWhiteSpace(input)) return false;
+
+            string projectRoot = AssetPathUtility.NormalizeSeparators(
+                Directory.GetParent(Application.dataPath)?.FullName ?? string.Empty
+            ).TrimEnd('/');
+            if (string.IsNullOrEmpty(projectRoot)) return false;
+
+            string value = AssetPathUtility.NormalizeSeparators(input.Trim());
+            const string uriPrefix = "mcpforunity://path/";
+            if (value.StartsWith(uriPrefix, StringComparison.OrdinalIgnoreCase))
+                value = value.Substring(uriPrefix.Length);
+
+            try
+            {
+                string candidate = Path.IsPathRooted(value) ? value : Path.Combine(projectRoot, value);
+                string canonical = AssetPathUtility.NormalizeSeparators(Path.GetFullPath(candidate));
+                if (!canonical.Equals(projectRoot, StringComparison.OrdinalIgnoreCase)
+                    && !canonical.StartsWith(projectRoot + "/", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                if (Directory.Exists(canonical)) return false;
+
+                var fileInfo = new FileInfo(canonical);
+                if (fileInfo.Exists && (fileInfo.Attributes & FileAttributes.ReparsePoint) != 0)
+                    return false;
+                var directory = fileInfo.Directory;
+                while (directory != null)
+                {
+                    if (directory.Exists && (directory.Attributes & FileAttributes.ReparsePoint) != 0)
+                        return false;
+                    string current = AssetPathUtility.NormalizeSeparators(directory.FullName).TrimEnd('/');
+                    if (current.Equals(projectRoot, StringComparison.OrdinalIgnoreCase)) break;
+                    if (!current.StartsWith(projectRoot + "/", StringComparison.OrdinalIgnoreCase)) return false;
+                    directory = directory.Parent;
+                }
+
+                fullPath = canonical;
+                relativePath = canonical.Substring(projectRoot.Length).TrimStart('/');
+                return !string.IsNullOrEmpty(relativePath);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string ComputeSha256(byte[] bytes)
+        {
+            using (var sha = SHA256.Create())
+            {
+                return BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", string.Empty).ToLowerInvariant();
+            }
+        }
+
+        private static bool TryReadTextFile(string fullPath, out TextFileState state, out string errorCode, out string errorMessage)
+        {
+            state = null;
+            errorCode = null;
+            errorMessage = null;
+            if (Directory.Exists(fullPath))
+            {
+                errorCode = "E_PATH";
+                errorMessage = "Directories cannot be read as text files.";
+                return false;
+            }
+            if (!File.Exists(fullPath))
+            {
+                errorCode = "E_PATH";
+                errorMessage = "Text file not found.";
+                return false;
+            }
+
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(fullPath);
+                int bomLength = 0;
+                bool hasBom = false;
+                Encoding encoding;
+                string encodingName;
+                if (bytes.Length >= 4 && bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0xFE && bytes[3] == 0xFF)
+                {
+                    encoding = new UTF32Encoding(true, true, true); encodingName = "utf-32be"; bomLength = 4; hasBom = true;
+                }
+                else if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0x00 && bytes[3] == 0x00)
+                {
+                    encoding = new UTF32Encoding(false, true, true); encodingName = "utf-32le"; bomLength = 4; hasBom = true;
+                }
+                else if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+                {
+                    encoding = new UTF8Encoding(true, true); encodingName = "utf-8"; bomLength = 3; hasBom = true;
+                }
+                else if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+                {
+                    encoding = new UnicodeEncoding(true, true, true); encodingName = "utf-16be"; bomLength = 2; hasBom = true;
+                }
+                else if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+                {
+                    encoding = new UnicodeEncoding(false, true, true); encodingName = "utf-16le"; bomLength = 2; hasBom = true;
+                }
+                else
+                {
+                    if (bytes.Any(b => b == 0))
+                    {
+                        errorCode = "E_BINARY";
+                        errorMessage = "NUL bytes indicate a binary or unsupported text file.";
+                        return false;
+                    }
+                    encoding = new UTF8Encoding(false, true); encodingName = "utf-8";
+                }
+
+                string contents = encoding.GetString(bytes, bomLength, bytes.Length - bomLength);
+                if (contents.Any(ch => ch == '\0' || (ch < ' ' && ch != '\t' && ch != '\n' && ch != '\r' && ch != '\f')))
+                {
+                    errorCode = "E_BINARY";
+                    errorMessage = "The file contains binary control characters.";
+                    return false;
+                }
+
+                int crlf = Regex.Matches(contents, "\\r\\n").Count;
+                int lf = Regex.Matches(contents, "(?<!\\r)\\n").Count;
+                int cr = Regex.Matches(contents, "\\r(?!\\n)").Count;
+                int kinds = (crlf > 0 ? 1 : 0) + (lf > 0 ? 1 : 0) + (cr > 0 ? 1 : 0);
+                string newline = kinds > 1 ? "mixed" : crlf > 0 ? "crlf" : cr > 0 ? "cr" : "lf";
+                state = new TextFileState
+                {
+                    Bytes = bytes,
+                    Contents = contents,
+                    Encoding = encoding,
+                    EncodingName = encodingName,
+                    HasBom = hasBom,
+                    Newline = newline,
+                    Sha256 = ComputeSha256(bytes),
+                };
+                return true;
+            }
+            catch (DecoderFallbackException ex)
+            {
+                errorCode = "E_BINARY";
+                errorMessage = $"The file is not valid supported text: {ex.Message}";
+                return false;
+            }
+            catch (Exception ex)
+            {
+                errorCode = "E_WRITE";
+                errorMessage = $"Failed to read text file: {ex.Message}";
+                return false;
+            }
+        }
+
         /// <summary>
         /// Resolves a directory under Assets/, preventing traversal and escaping.
         /// Returns fullPathDir on disk and canonical 'Assets/...' relative path.
@@ -138,6 +305,21 @@ namespace MCPForUnity.Editor.Tools
                 return new ErrorResponse(actionResult.ErrorMessage);
             }
             string action = actionResult.Value.ToLowerInvariant();
+
+            if (action == "read_text" || action == "apply_hashline_edits")
+            {
+                string file = p.Get("file");
+                if (!TryResolveProjectFile(file, out string textFullPath, out string textRelativePath))
+                    return new ErrorResponse("E_PATH", new { message = "Path must resolve to a non-symlink file inside the Unity project root." });
+                if (action == "read_text")
+                    return ReadTextFile(textFullPath, textRelativePath);
+
+                string encodedContents = p.Get("encodedContents");
+                string precondition = p.Get("precondition_sha256");
+                var textOptions = p.GetRaw("options") as JObject;
+                string refreshMode = textOptions?["refresh"]?.ToString()?.ToLowerInvariant();
+                return ApplyHashlineText(textFullPath, textRelativePath, encodedContents, precondition, refreshMode);
+            }
 
             var nameResult = p.GetRequired("name");
             if (!nameResult.IsSuccess)
@@ -397,6 +579,185 @@ namespace MCPForUnity.Editor.Tools
             catch (Exception e)
             {
                 return new ErrorResponse($"Failed to create script '{relativePath}': {e.Message}");
+            }
+        }
+
+        private static object ReadTextFile(string fullPath, string relativePath)
+        {
+            if (!TryReadTextFile(fullPath, out TextFileState state, out string code, out string message))
+                return new ErrorResponse(code, new { message, path = relativePath });
+
+            return new SuccessResponse(
+                $"Text file '{relativePath}' read successfully.",
+                new
+                {
+                    uri = $"mcpforunity://path/{relativePath}",
+                    path = relativePath,
+                    contents = state.Contents,
+                    sha256 = state.Sha256,
+                    encoding = state.EncodingName,
+                    hasBom = state.HasBom,
+                    newline = state.Newline,
+                    lengthBytes = state.Bytes.LongLength,
+                }
+            );
+        }
+
+        private static byte[] EncodeText(TextFileState original, string contents)
+        {
+            byte[] body = original.Encoding.GetBytes(contents);
+            if (!original.HasBom) return body;
+            byte[] preamble = original.Encoding.GetPreamble();
+            if (preamble == null || preamble.Length == 0) return body;
+            byte[] result = new byte[preamble.Length + body.Length];
+            Buffer.BlockCopy(preamble, 0, result, 0, preamble.Length);
+            Buffer.BlockCopy(body, 0, result, preamble.Length, body.Length);
+            return result;
+        }
+
+        private static void RefreshTextFile(string relativePath, string refreshMode)
+        {
+            bool immediate = string.Equals(refreshMode, "immediate", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(refreshMode, "sync", StringComparison.OrdinalIgnoreCase);
+            bool isAssetPath = relativePath.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
+                || relativePath.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase);
+            bool isScript = relativePath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
+
+            if (isScript && relativePath.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) && !immediate)
+            {
+                ManageScriptRefreshHelpers.ScheduleScriptRefresh(relativePath);
+                return;
+            }
+
+            Action refresh = () =>
+            {
+                if (isAssetPath)
+                {
+                    var importOptions = ImportAssetOptions.ForceUpdate;
+                    if (immediate) importOptions |= ImportAssetOptions.ForceSynchronousImport;
+                    AssetDatabase.ImportAsset(relativePath, importOptions);
+                }
+                else
+                {
+                    AssetDatabase.Refresh(immediate ? ImportAssetOptions.ForceSynchronousImport : ImportAssetOptions.Default);
+                }
+#if UNITY_EDITOR
+                if (isScript)
+                {
+                    CompilationRequestTracker.MarkRequested();
+                    CompilationPipeline.RequestScriptCompilation();
+                }
+#endif
+            };
+            if (immediate) refresh();
+            else EditorApplication.delayCall += () => refresh();
+        }
+
+        private static object ApplyHashlineText(
+            string fullPath,
+            string relativePath,
+            string encodedContents,
+            string preconditionSha256,
+            string refreshMode)
+        {
+            if (encodedContents == null)
+                return new ErrorResponse("E_BAD_SHAPE", new { message = "encodedContents is required." });
+            if (!TryReadTextFile(fullPath, out TextFileState original, out string code, out string message))
+                return new ErrorResponse(code, new { message, path = relativePath });
+            if (string.IsNullOrEmpty(preconditionSha256))
+                return new ErrorResponse("E_PRECONDITION", new { message = "precondition_sha256 is required.", current_sha256 = original.Sha256 });
+            if (!preconditionSha256.Equals(original.Sha256, StringComparison.OrdinalIgnoreCase))
+                return new ErrorResponse("E_PRECONDITION", new
+                {
+                    message = "The file changed before the atomic write.",
+                    expected_sha256 = preconditionSha256,
+                    current_sha256 = original.Sha256,
+                });
+
+            string contents;
+            try
+            {
+                byte[] utf8 = Convert.FromBase64String(encodedContents);
+                if (utf8.Length > MaxHashlinePayloadBytes)
+                    return new ErrorResponse("E_BAD_SHAPE", new { message = "Hashline payload exceeds the supported limit.", limitBytes = MaxHashlinePayloadBytes });
+                contents = new UTF8Encoding(false, true).GetString(utf8);
+            }
+            catch (Exception ex)
+            {
+                return new ErrorResponse("E_BAD_SHAPE", new { message = $"Invalid UTF-8 encodedContents: {ex.Message}" });
+            }
+
+            byte[] replacement;
+            try { replacement = EncodeText(original, contents); }
+            catch (Exception ex) { return new ErrorResponse("E_WRITE", new { message = $"Failed to preserve file encoding: {ex.Message}" }); }
+            string replacementSha = ComputeSha256(replacement);
+            if (replacementSha.Equals(original.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                return new SuccessResponse("No-op: text contents are unchanged.", new
+                {
+                    uri = $"mcpforunity://path/{relativePath}",
+                    path = relativePath,
+                    sha256 = original.Sha256,
+                    no_op = true,
+                    scheduledRefresh = false,
+                });
+            }
+
+            string tempPath = fullPath + ".hashline-" + Guid.NewGuid().ToString("N") + ".tmp";
+            string backupPath = fullPath + ".hashline-" + Guid.NewGuid().ToString("N") + ".bak";
+            try
+            {
+                using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    stream.Write(replacement, 0, replacement.Length);
+                    stream.Flush(true);
+                }
+
+                // Recheck immediately before replacement to close the read/write race.
+                byte[] beforeReplace = File.ReadAllBytes(fullPath);
+                string finalPrecondition = ComputeSha256(beforeReplace);
+                if (!finalPrecondition.Equals(preconditionSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    return new ErrorResponse("E_PRECONDITION", new
+                    {
+                        message = "The file changed immediately before the atomic replace.",
+                        expected_sha256 = preconditionSha256,
+                        current_sha256 = finalPrecondition,
+                    });
+                }
+
+                File.Replace(tempPath, fullPath, backupPath);
+                try { if (File.Exists(backupPath)) File.Delete(backupPath); } catch { }
+                bool scheduled = !string.Equals(refreshMode, "immediate", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(refreshMode, "sync", StringComparison.OrdinalIgnoreCase);
+                string refreshWarning = null;
+                try { RefreshTextFile(relativePath, refreshMode); }
+                catch (Exception refreshException)
+                {
+                    scheduled = false;
+                    refreshWarning = refreshException.Message;
+                    McpLog.Warn($"[ManageScript] Text edit succeeded but refresh failed for '{relativePath}': {refreshException.Message}");
+                }
+                return new SuccessResponse("Hashline text changes applied atomically.", new
+                {
+                    uri = $"mcpforunity://path/{relativePath}",
+                    path = relativePath,
+                    sha256 = replacementSha,
+                    encoding = original.EncodingName,
+                    hasBom = original.HasBom,
+                    newline = original.Newline,
+                    scheduledRefresh = scheduled,
+                    refreshWarning,
+                });
+            }
+            catch (Exception ex)
+            {
+                return new ErrorResponse("E_WRITE", new { message = $"Atomic text replacement failed: {ex.Message}" });
+            }
+            finally
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                try { if (File.Exists(backupPath)) File.Delete(backupPath); } catch { }
             }
         }
 
@@ -791,6 +1152,7 @@ namespace MCPForUnity.Editor.Tools
                         ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate
                     );
 #if UNITY_EDITOR
+                    CompilationRequestTracker.MarkRequested();
                     UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
                 }
@@ -2984,6 +3346,7 @@ namespace MCPForUnity.Editor.Tools
                     AssetDatabase.ImportAsset(sp, ImportAssetOptions.ForceUpdate | ImportAssetOptions.ForceSynchronousImport);
                 }
 #if UNITY_EDITOR
+                CompilationRequestTracker.MarkRequested();
                 UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
                 // Fallback if needed:
@@ -3020,6 +3383,7 @@ namespace MCPForUnity.Editor.Tools
             if (synchronous) opts |= ImportAssetOptions.ForceSynchronousImport;
             AssetDatabase.ImportAsset(sp, opts);
 #if UNITY_EDITOR
+            CompilationRequestTracker.MarkRequested();
             UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
         }

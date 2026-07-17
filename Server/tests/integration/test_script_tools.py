@@ -40,10 +40,8 @@ async def test_apply_text_edits_long_file(monkeypatch):
             "endLine": 1005, "endCol": 5, "newText": "Hello"}
     ctx = DummyContext()
     resp = await apply_edits(ctx, "mcpforunity://path/Assets/Scripts/LongFile.cs", [edit])
-    assert captured["cmd"] == "manage_script"
-    assert captured["params"]["action"] == "apply_text_edits"
-    assert captured["params"]["edits"][0]["startLine"] == 1005
-    assert resp["success"] is True
+    assert captured == {}
+    assert resp["code"] == "E_LEGACY_SHAPE"
 
 
 @pytest.mark.asyncio
@@ -68,17 +66,8 @@ async def test_sequential_edits_use_precondition(monkeypatch):
     edit1 = {"startLine": 1, "startCol": 0, "endLine": 1,
              "endCol": 0, "newText": "//header\n"}
     resp1 = await apply_edits(DummyContext(), "mcpforunity://path/Assets/Scripts/File.cs", [edit1])
-    edit2 = {"startLine": 2, "startCol": 0, "endLine": 2,
-             "endCol": 0, "newText": "//second\n"}
-    resp2 = await apply_edits(
-        DummyContext(),
-        "mcpforunity://path/Assets/Scripts/File.cs",
-        [edit2],
-        precondition_sha256=resp1["sha256"],
-    )
-
-    assert calls[1]["precondition_sha256"] == resp1["sha256"]
-    assert resp2["sha256"] == "hash2"
+    assert resp1["code"] == "E_LEGACY_SHAPE"
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -107,7 +96,7 @@ async def test_apply_text_edits_forwards_options(monkeypatch):
         [{"startLine": 1, "startCol": 1, "endLine": 1, "endCol": 1, "newText": "x"}],
         options=opts,
     )
-    assert captured["params"].get("options") == opts
+    assert captured == {}
 
 
 @pytest.mark.asyncio
@@ -140,8 +129,7 @@ async def test_apply_text_edits_defaults_atomic_for_multi_span(monkeypatch):
         edits,
         precondition_sha256="x",
     )
-    opts = captured["params"].get("options", {})
-    assert opts.get("applyMode") == "atomic"
+    assert captured == {}
 
 
 @pytest.mark.asyncio
