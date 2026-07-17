@@ -124,9 +124,8 @@ async def preflight(
                 return None
 
     if require_test_readiness:
-        # Require two fresh, consecutive snapshots. This closes the single-snapshot
-        # TOCTOU window while Unity transitions from a queued request to compilation.
-        previous_sequence = None
+        # Require two fresh, consecutive snapshots. An unchanged sequence is valid:
+        # it means the editor state remained stable between observations.
         stable_samples = 0
         deadline = time.monotonic() + float(max_wait_s)
         while stable_samples < 2:
@@ -136,6 +135,11 @@ async def preflight(
             play_mode = editor.get("play_mode") or {} if isinstance(editor, dict) else {}
             assets = data.get("assets") or {}
             refresh = assets.get("refresh") or {} if isinstance(assets, dict) else {}
+            staleness = data.get("staleness") or {}
+            is_fresh = (
+                isinstance(staleness, dict)
+                and staleness.get("is_stale") is False
+            )
             blocked = (
                 compilation.get("is_compiling") is True
                 or compilation.get("is_domain_reload_pending") is True
@@ -148,12 +152,10 @@ async def preflight(
                 or refresh.get("is_refresh_in_progress") is True
                 or assets.get("external_changes_dirty") is True
             )
-            sequence = data.get("sequence")
-            if not blocked and sequence != previous_sequence:
+            if is_fresh and not blocked:
                 stable_samples += 1
             else:
                 stable_samples = 0
-            previous_sequence = sequence
             if stable_samples >= 2:
                 break
             if time.monotonic() >= deadline:
